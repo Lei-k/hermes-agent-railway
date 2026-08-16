@@ -1,21 +1,16 @@
 # 03 — 實作計畫
 
-分五個階段。階段 0–2 是可上線的最小完整部署；階段 3–4 是強化與擴充。
+分四個階段。階段 1–2 是可上線的最小完整部署；階段 3–4 是強化與擴充。
+
+> **階段 0（fork 映像流水線）已取消。** fork 與 upstream 零分歧，改用上游預建映像，fork repo 完全不動。原內容移到文末附錄，供日後真的需要改核心原始碼時參考。
 
 ---
 
 ## 目標倉庫結構
 
-**A. `Lei-k/hermes-agent`（fork，階段 0）**
-```
-.github/workflows/
-└── fork-image.yml                        # 建 amd64 映像 → 推 GHCR
-```
-
-**B. `hermes-agent-railway`（本 repo）**
 ```
 hermes-agent-railway/
-├── Dockerfile                            # 薄封裝：FROM ghcr.io/lei-k/hermes-agent:<sha>
+├── Dockerfile                            # 薄封裝：FROM nousresearch/hermes-agent:<tag>
 ├── railway.toml                          # builder / healthcheck / restart policy
 ├── .dockerignore
 ├── docker/
@@ -30,104 +25,6 @@ hermes-agent-railway/
 
 ---
 
-## 階段 0：fork 映像流水線
-
-### 為什麼需要
-
-上游 `.github/workflows/docker.yml` 的 build job 有守衛：
-
-```yaml
-build:
-  if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true'
-```
-
-**在 fork 上永遠不會執行**，而且發佈目標是 `nousresearch/hermes-agent`（fork 也拿不到那組 Docker Hub secret）。fork 必須有自己的 workflow。
-
-### 為什麼不讓 Railway 直接建 fork 原始碼
-
-| 項目 | 上游 Dockerfile 的實際成本 |
-|---|---|
-| 建置時間 | 上游自己把 job timeout 設在 **45 分鐘**；註解自述冷建置 15–45 分鐘 |
-| 映像大小 | 上游註解直言 **「the image is 5GB+」** |
-| 建置內容 | 從原始碼編 SQLite 3.53.4 → 抓 s6-overlay → 複製 Node 26 → `npm install` + Playwright Chromium → photon sidecar `npm ci` → `uv sync` 八個 extras → 建 `web/` 與 `ui-tui/` 前端 |
-
-GitHub Actions 有 `type=gha,mode=max` 的 layer cache、可以只建 amd64（Railway 只跑 amd64，省掉 arm64 那半），而且不會佔住 Railway 的部署流程。兩層分離之後，Railway 端每次部署只建薄封裝，是秒級。
-
-### 0.1 `Lei-k/hermes-agent` 的 `.github/workflows/fork-image.yml`
-
-```yaml
-name: Fork image → GHCR
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: write
-
-concurrency:
-  group: fork-image-${{ github.ref }}
-  cancel-in-progress: false        # 每個 merge 都要有自己的映像
-
-env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/hermes-agent
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    # 上游同等 job 設 45 分鐘；冷建置（無 cache）會用掉大半
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - id: meta
-        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          # 只建 amd64 —— Railway 跑 amd64，省掉 arm64 的一半建置時間
-          platforms: linux/amd64
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}
-            ${{ env.IMAGE }}:main
-          build-args: |
-            HERMES_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha,scope=fork-amd64
-          cache-to: type=gha,mode=max,scope=fork-amd64
-```
-
-> `HERMES_GIT_SHA` build-arg 會被烤進 `/opt/hermes/.hermes_build_sha`，讓 `hermes dump` 與啟動 banner 能報出正確的 commit——容器問題排查時這是唯一能確認「到底跑的是哪個 commit」的線索。
-
-### 0.2 GHCR package 可見性
-
-兩個選擇：
-
-- **設為 public**（`ghcr.io/lei-k/hermes-agent`）→ Railway 直接拉，零設定。前提是 fork 的修改可公開。
-- **保持 private** → Railway 需要 registry credentials。Railway 文件說明 GHCR 要用 **personal access token**（不是密碼）作為認證。需在 Railway service 設定 registry 帳密。
-
-薄封裝的 Dockerfile 在 Railway build 階段拉基底映像，所以 credentials 必須在 **build** 階段可用。若 private 這條路在 Railway 上遇到阻礙（列為待驗證 A15），退路是把薄封裝那一層也搬進 GitHub Actions，Railway 改成純 image source 部署——但那樣就得放棄 `railway.toml` 的 config-as-code，改用 start command `/opt/hermes/docker/entrypoint-dispatch.sh gateway run`（唯一安全的覆蓋寫法）。
-
-### 階段 0 完成定義
-- [ ] workflow 成功推出 `ghcr.io/lei-k/hermes-agent:<sha>`
-- [ ] 本機 `docker pull` + `docker run --rm <image> version` 可執行
-- [ ] 本機量測未壓縮映像大小（預期 ~5 GB，Pro 方案無上限）
-- [ ] 決定 package 可見性；private 的話 Railway registry credentials 已設好
-
----
-
 ## 階段 1：容器落地
 
 ### 1.1 `Dockerfile`（本 repo）
@@ -135,10 +32,10 @@ jobs:
 ```dockerfile
 # syntax=docker/dockerfile:1
 
-# fork 自建映像（階段 0 產出）。釘死 commit sha，不用 :main：
+# 上游官方預建映像。釘死版本標籤，不用 latest / main：
 # 未釘版會讓 Railway 的執行環境在無預警下改變。
-ARG HERMES_IMAGE=ghcr.io/lei-k/hermes-agent
-ARG HERMES_TAG=<commit-sha>
+ARG HERMES_IMAGE=nousresearch/hermes-agent
+ARG HERMES_TAG=v2026.8.13
 FROM ${HERMES_IMAGE}:${HERMES_TAG}
 
 # Railway 專用開機 hook。
@@ -461,29 +358,17 @@ tool_loop_guardrails:
 
 ## 階段 4：維運與擴充
 
-### 4.1 上游同步與版本升級
+### 4.1 版本升級
 
-因為 fork 有自訂修改，升級是兩段式：
+因為用的是上游預建映像，升級只有一步：改 `Dockerfile` 的 `ARG HERMES_TAG` → commit → Railway 自動重建薄封裝（秒級）。也可以在 Railway service variables 設同名變數覆寫，連程式碼都不用動。
 
-```
-upstream/main ──merge──> Lei-k/hermes-agent:main
-                              │ push 觸發 fork-image.yml
-                              ↓
-                    ghcr.io/lei-k/hermes-agent:<new-sha>
-                              │ 更新本 repo Dockerfile 的 HERMES_TAG
-                              ↓
-                         Railway 重建薄封裝（秒級）
-```
+上游大約每週發一個版本標籤（`v2026.7.1` → `v2026.8.13`），標籤清單在 [Docker Hub](https://hub.docker.com/r/nousresearch/hermes-agent/tags)。
 
-1. fork 合併上游變更，解決 conflict
-2. workflow 自動建置推 GHCR（60 分鐘內）
-3. 改本 repo `Dockerfile` 的 `ARG HERMES_TAG` → commit → Railway 自動重建
-4. 開機時 `stage2-hook.sh` 自動跑 `docker_config_migrate.py`，需要時把 `config.yaml`/`.env` 備份成時間戳檔案
-5. 從 `/api/status` 確認版本
+開機時 `stage2-hook.sh` 自動跑 `docker_config_migrate.py`，需要時把 `config.yaml`/`.env` 備份成時間戳檔案。從 `/api/status` 確認版本。
 
 掛了 volume 的 service 重新部署會有短暫停機（Railway 平台限制），屬預期行為。
 
-**回滾**：把 `HERMES_TAG` 改回舊 sha 即可——GHCR 上每個 commit 都有映像。
+**回滾**：`HERMES_TAG` 改回舊標籤即可——Docker Hub 上舊版本都還在。
 
 ### 4.2 備份
 
@@ -513,3 +398,116 @@ Dashboard 是機器層級的，側邊欄 profile 切換器即可管理全部 pro
 - `/api/status` 提供版本、gateway 狀態、活躍 session 數
 - Dashboard 內建資源壓力橫幅（記憶體 < 128 MiB 或 < 15% 告警、疑似 OOM 重啟偵測、volume 剩餘 < 512 MB 告警）
 - 跨部署保留的日誌：`/opt/data/logs/gateways/default/current`、`/opt/data/logs/container-boot.log`
+
+---
+
+## 附錄 — 自建映像流水線（未採用）
+
+> **目前不需要。** fork 與 upstream 零分歧，直接用上游預建映像。
+>
+> 只有當你開始修改 Hermes 的**核心原始碼**（`cli.py`、`run_agent.py`、
+> `hermes_state.py`、agent loop⋯）時才需要這一段。plugin / skill / SOUL /
+> config / apt / pip / npm 這類客製化都能在薄封裝那一層疊，不必自建。
+>
+> **注意 workflow 該放哪**：放在**本 repo**（`hermes-agent-railway`）並
+> checkout `Lei-k/hermes-agent` 當第二個 source，fork repo 就不用被改動。
+> 下面的範例是放在 fork 裡的版本，搬過來時把 `actions/checkout` 改成
+> `with: {repository: Lei-k/hermes-agent, ref: <sha>}` 即可。
+
+### 為什麼需要
+
+### 為什麼需要
+
+上游 `.github/workflows/docker.yml` 的 build job 有守衛：
+
+```yaml
+build:
+  if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true'
+```
+
+**在 fork 上永遠不會執行**，而且發佈目標是 `nousresearch/hermes-agent`（fork 也拿不到那組 Docker Hub secret）。fork 必須有自己的 workflow。
+
+### 為什麼不讓 Railway 直接建 fork 原始碼
+
+| 項目 | 上游 Dockerfile 的實際成本 |
+|---|---|
+| 建置時間 | 上游自己把 job timeout 設在 **45 分鐘**；註解自述冷建置 15–45 分鐘 |
+| 映像大小 | 上游註解直言 **「the image is 5GB+」** |
+| 建置內容 | 從原始碼編 SQLite 3.53.4 → 抓 s6-overlay → 複製 Node 26 → `npm install` + Playwright Chromium → photon sidecar `npm ci` → `uv sync` 八個 extras → 建 `web/` 與 `ui-tui/` 前端 |
+
+GitHub Actions 有 `type=gha,mode=max` 的 layer cache、可以只建 amd64（Railway 只跑 amd64，省掉 arm64 那半），而且不會佔住 Railway 的部署流程。兩層分離之後，Railway 端每次部署只建薄封裝，是秒級。
+
+### 0.1 `Lei-k/hermes-agent` 的 `.github/workflows/fork-image.yml`
+
+```yaml
+name: Fork image → GHCR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: false        # 每個 merge 都要有自己的映像
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hermes-agent
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 上游同等 job 設 45 分鐘；冷建置（無 cache）會用掉大半
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          # 只建 amd64 —— Railway 跑 amd64，省掉 arm64 的一半建置時間
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}
+            ${{ env.IMAGE }}:main
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=fork-amd64
+          cache-to: type=gha,mode=max,scope=fork-amd64
+```
+
+> `HERMES_GIT_SHA` build-arg 會被烤進 `/opt/hermes/.hermes_build_sha`，讓 `hermes dump` 與啟動 banner 能報出正確的 commit——容器問題排查時這是唯一能確認「到底跑的是哪個 commit」的線索。
+
+### 0.2 GHCR package 可見性
+
+兩個選擇：
+
+- **設為 public**（`ghcr.io/lei-k/hermes-agent`）→ Railway 直接拉，零設定。前提是 fork 的修改可公開。
+- **保持 private** → Railway 需要 registry credentials。Railway 文件說明 GHCR 要用 **personal access token**（不是密碼）作為認證。需在 Railway service 設定 registry 帳密。
+
+薄封裝的 Dockerfile 在 Railway build 階段拉基底映像，所以 credentials 必須在 **build** 階段可用。若 private 這條路在 Railway 上遇到阻礙（列為待驗證 A15），退路是把薄封裝那一層也搬進 GitHub Actions，Railway 改成純 image source 部署——但那樣就得放棄 `railway.toml` 的 config-as-code，改用 start command `/opt/hermes/docker/entrypoint-dispatch.sh gateway run`（唯一安全的覆蓋寫法）。
+
+### 完成定義
+- [ ] workflow 成功推出 `ghcr.io/lei-k/hermes-agent:<sha>`
+- [ ] 本機 `docker pull` + `docker run --rm <image> version` 可執行
+- [ ] 本機量測未壓縮映像大小（預期 ~5 GB，Pro 方案無上限）
+- [ ] 決定 package 可見性；private 的話 Railway registry credentials 已設好
+
+---

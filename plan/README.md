@@ -20,7 +20,7 @@
 
 | # | 決策 | 影響 |
 |---|---|---|
-| 1 | **fork 會有自訂修改** | 不能用上游預建映像。需要自建映像流水線（階段 0） |
+| 1 | ~~fork 會有自訂修改~~ → **改為不侵入部署** | fork 目前與 upstream 零分歧（`behind_by=0`、無自有 commit），改用上游預建映像 `nousresearch/hermes-agent:v2026.8.13`。**fork repo 完全不動**，階段 0 取消。多數客製化可疊在薄封裝上；只有改核心原始碼才需要自建流水線（`03` 附錄） |
 | 2 | **Railway Pro 方案** | 映像大小無限、volume 1 TB、記憶體充足。原本的容量顧慮全部解除 |
 | 3 | **Google 認證 + 要能管理可進入的使用者** → **採用 Auth0** | Google 當 Auth0 的 social connection，白名單寫成 Auth0 post-login Action。**Hermes 沒有任何使用者白名單**，這是必須補的一層——見 [`07`](./07-dashboard-access-control.md) |
 | 4 | **Telegram**（polling 模式） | 不佔額外對外埠 |
@@ -35,16 +35,12 @@
 
 ## 決策摘要（TL;DR）
 
-**採用架構**：兩層映像 + 單一 Railway service。fork 由 GitHub Actions 建成完整映像推到 GHCR；Railway 只建一層薄封裝（秒級）。容器內由 s6-overlay 同時監管 gateway 與 web dashboard，dashboard 綁 `0.0.0.0:$PORT` 作為唯一對外入口，volume 掛 `/opt/data`。
+**採用架構**：上游預建映像 + 一層薄封裝 + 單一 Railway service。**不動 fork repo**，Railway 只建薄封裝（秒級）。容器內由 s6-overlay 同時監管 gateway 與 web dashboard，dashboard 綁 `0.0.0.0:$PORT` 作為唯一對外入口，volume 掛 `/opt/data`。
 
 ```
-┌─ GitHub Actions (Lei-k/hermes-agent) ─────────────────────┐
-│  build amd64 only → ghcr.io/lei-k/hermes-agent:<sha>      │
-│  (~5 GB 未壓縮 / 上游 timeout 設 45 分鐘 / GHA layer cache) │
-└────────────────────────┬───────────────────────────────────┘
-                         │ FROM
+        nousresearch/hermes-agent:v2026.8.13   （上游官方預建映像）
+                         │ FROM（本 repo 的薄封裝，秒級建置）
 ┌─ Railway Service (Pro, 1 replica) ────────────────────────┐
-│  本 repo 的薄封裝 Dockerfile（+ CMD、+ 開機 hook）          │
 │  ENTRYPOINT: entrypoint-dispatch.sh → /init (s6, PID 1)   │
 │                                                            │
 │   cont-init.d:  01-hermes-setup (chown/seed/migrate)       │
@@ -63,7 +59,7 @@
 
 ### 關鍵決策與理由
 
-1. **fork 自建映像 → GHCR → Railway 只建薄封裝。**
+1. **用上游預建映像，不自建。**
    上游 `.github/workflows/docker.yml` 的 build job 有 `if: github.repository == 'NousResearch/hermes-agent'` 的守衛，**在 fork 上完全不會執行**，所以 fork 必須有自己的 workflow。不讓 Railway 直接建 fork 原始碼的原因：上游冷建置要編 SQLite、裝 Playwright、`uv sync` 全套 extras、建兩個前端，timeout 設 45 分鐘、映像 5 GB+；GitHub Actions 有 layer cache 且可只建 amd64（Railway 只跑 amd64，省一半時間），Railway 端則維持秒級建置。
 
 2. **Railway 的 start command 必須留空。**
@@ -127,6 +123,6 @@ Railway + Pro 方案下有三個可行選項：
 
 ## 下一步
 
-計畫已完整。要動工時的順序是：階段 0（fork CI 映像）→ 階段 1（容器落地）→ 階段 2（代理人可用）→ 階段 3（安全）→ 階段 4（維運）。
+計畫已完整。要動工時的順序是：階段 1（容器落地）→ 階段 2（代理人可用）→ 階段 3（安全）→ 階段 4（維運）。**fork repo 不需要任何改動。**
 
-實體檔案（`Dockerfile`、`railway.toml`、`016-railway-bootstrap`、fork 的 workflow）的完整內容都寫在 [`03-implementation-plan.md`](./03-implementation-plan.md) 裡，可直接複製使用。
+實體檔案（`Dockerfile`、`railway.toml`、`016-railway-bootstrap`）的完整內容都寫在 [`03-implementation-plan.md`](./03-implementation-plan.md) 裡，可直接複製使用。

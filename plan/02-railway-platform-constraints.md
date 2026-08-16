@@ -94,13 +94,11 @@
 
 **仍然成立的對策**（理由從「容量」變成「建置時間與流程」）：
 - **不在 Railway 上從頭建 Hermes。** 上游自己把該 job 的 timeout 設在 **45 分鐘**，註解直言 **「the image is 5GB+」**，而且建置內容是：從原始碼編 SQLite 3.53.4 → 抓 s6-overlay → 複製 Node 26 → `npm install` + Playwright Chromium → photon sidecar `npm ci` → `uv sync` 八個 extras → 建 `web/` 與 `ui-tui/` 兩個前端。
-- **fork 的完整映像交給 GitHub Actions**（有 `type=gha,mode=max` layer cache，且可只建 amd64——Railway 只跑 amd64，省掉 arm64 那一半），推到 GHCR。
-- **Railway 只建薄封裝**（`FROM ghcr.io/lei-k/hermes-agent:<sha>` + COPY 一支腳本 + CMD），建置時間以秒計。
-- **基底映像釘死 commit sha**，不用 `:main`——避免執行環境在無預警下改變。GHCR 上每個 commit 都有映像，回滾只是改一個 `ARG`。
+- **用上游官方預建映像 `nousresearch/hermes-agent`**（Docker Hub，公開，壓縮後約 937 MB）。fork 與 upstream `behind_by=0` 且無自有 commit，自建一份沒有意義；也完全不需要碰 fork repo。
+- **Railway 只建薄封裝**（`FROM nousresearch/hermes-agent:<tag>` + COPY 一支腳本 + CMD），建置時間以秒計。
+- **釘死版本標籤**（`v2026.8.13`），不用 `latest` / `main`——避免執行環境在無預警下改變。回滾只是把 `ARG HERMES_TAG` 改回舊標籤，Docker Hub 上舊版本都還在。
 
-**注意**：上游 `.github/workflows/docker.yml` 的 build job 有 `if: github.repository == 'NousResearch/hermes-agent'` 守衛，**在 fork 上永遠不會執行**，且發佈目標 `nousresearch/hermes-agent` 的 Docker Hub secret fork 也拿不到。fork 必須有自己的 workflow（見 `03` 階段 0）。
-
-**GHCR 認證**：Railway 支援從 GHCR 拉映像，private package 需要 personal access token（不是密碼）。薄封裝在 **build** 階段拉基底映像，所以 credentials 必須在 build 階段可用——列為待驗證 A15。
+**日後若要改核心原始碼**：上游 `.github/workflows/docker.yml` 的 build job 有 `if: github.repository == 'NousResearch/hermes-agent'` 守衛，**在 fork 上永遠不會執行**，且發佈目標的 Docker Hub secret fork 也拿不到，所以需要自己的 workflow。把它放在**本 repo**（checkout fork 為第二個 source）就能維持 fork 不被改動——見 `03` 附錄。
 
 ---
 

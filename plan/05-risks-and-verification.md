@@ -1,6 +1,6 @@
 # 05 — 風險、待驗證假設與驗收
 
-依已確認決策更新（Pro 方案、fork 自建映像、OIDC、需要瀏覽器工具、純變數路徑）。
+依已確認決策更新（Pro 方案、**上游預建映像／不動 fork**、Auth0、需要瀏覽器工具、純變數路徑）。
 
 ## 1. 風險清單
 
@@ -43,17 +43,12 @@ Hermes 的工具集包含在容器內執行任意指令。任何通過 dashboard
 
 - **緩解**：`04` §2 的操作紀律寫進 repo README；用 `hermes dump` / `hermes doctor` 確認實際生效值；`API_SERVER_KEY` 是無法避免的例外（stage2 一定會自動產生），接受即可。
 
-### R5 — fork 與上游的合併維護成本 🟠 中
+### R5 — 上游版本升級的相容性 🟡 中低
 
-fork 有自訂修改，上游幾乎每週發版（`v2026.7.1` → `v2026.8.13`）。`cli.py` 933 KB、`hermes_state.py` 583 KB、`run_agent.py` 417 KB——這些巨檔上的修改在合併時衝突機率高。
+上游幾乎每週發版（`v2026.7.1` → `v2026.8.13`）。因為改用預建映像且不動 fork，**合併衝突的風險完全消失**，剩下的只是升級後行為變動。
 
-- **緩解**：修改盡量做在 plugin / skill / config 層（`/opt/data` 可寫）而非核心；核心修改保持小而集中；升級前讀上游 changelog；GHCR 上每個 commit 都有映像，回滾只是改 `HERMES_TAG`。
-
-### R6 — GHCR private package 的 Railway 認證路徑未驗證 🟡 中低
-
-薄封裝在 Railway build 階段拉基底映像，所以 registry credentials 必須在 build 階段可用。Railway 文件說 GHCR 要用 personal access token。
-
-- **緩解**：先把 package 設 public（若 fork 修改可公開）；否則走 registry credentials，失敗的退路是把薄封裝那層也搬進 GitHub Actions，Railway 改純 image source 部署（但會失去 `railway.toml`，且必須設 start command `/opt/hermes/docker/entrypoint-dispatch.sh gateway run`）。
+- **緩解**：釘死版本標籤不用 `latest`；升級前讀上游 changelog；`stage2-hook.sh` 會在 config migration 前把 `config.yaml`/`.env` 備份成時間戳檔案；回滾只是把 `HERMES_TAG` 改回舊標籤（Docker Hub 上舊版本都還在）。
+- **日後若開始改核心原始碼**，合併成本才會回來（`cli.py` 933 KB、`hermes_state.py` 583 KB、`run_agent.py` 417 KB，巨檔衝突機率高）。屆時盡量把修改做在 plugin / skill / config 層而非核心。
 
 ### R6b — Railway 產生的網域是第二個對外入口 🟡 中低（安全）
 
@@ -100,13 +95,13 @@ fork 有自訂修改，上游幾乎每週發版（`v2026.7.1` → `v2026.8.13`�
 | A6 | `/api/health` 在驗證閘開啟時仍回 200 且不需 cookie | `curl -i https://<domain>/api/health` |
 | A7 | Railway healthcheck 的 `healthcheck.railway.app` Host 標頭不會被 dashboard 拒絕 | deploy 是否通過 healthcheck；失敗時 log 顯示 400 / service unavailable |
 | A8 | Dashboard Chat 分頁的 WebSocket (`/api/pty`) 能通過 Railway proxy | 開 Chat 分頁實際對話 |
-| A9 | fork 映像未壓縮大小（預期 ~5 GB） | 本機 `docker pull` + `docker images` |
+| ~~A9~~ | ~~fork 映像大小~~ — **不適用**：改用上游預建映像（Docker Hub 顯示壓縮後 937 MB），且 Pro 方案映像大小無上限 | — |
 | A10 | `016-railway-bootstrap` 寫入 `/run/s6/container_environment/` 的變數，dashboard 服務讀得到 | `railway ssh` 檢查 dashboard 實際綁的埠 |
 | A11 | `hermes config set` 可在 cont-init（root，經 exec shim 降權）環境下正常執行且不過慢 | 首次開機後 `hermes config get model`；量測開機時間 |
 | A12 | 掛 volume 時 Railway 不會出現兩個 active deployment 並存 | 觀察一次重新部署 |
 | ~~A13~~ | ~~IdP 需 public + PKCE client~~ — **已解除**：原始碼確認 confidential client（PKCE + `client_secret`）也支援，Google Web application client 可直接用 | — |
 | **A14** | 瀏覽器工具在 Railway 上可用（`AGENT_BROWSER_ARGS` 補上後） | 讓代理人跑 `browser_navigate` + `browser_snapshot` |
-| **A15** | GHCR private package 的 Railway registry credentials 在 **build** 階段可用 | 薄封裝建置能成功拉到基底映像 |
+| ~~A15~~ | ~~GHCR private 認證~~ — **不適用**：基底改為 Docker Hub 上的公開映像 `nousresearch/hermes-agent` | — |
 | **A16** | `agent-browser` CLI 的 `npx` 解析路徑在唯讀 `/opt/hermes` + `HERMES_DISABLE_LAZY_INSTALLS=1` 下可運作 | 首次瀏覽器工具呼叫是否成功；npm cache 應落在 `/opt/data` |
 | **A17** | `CLAUDE_CODE_OAUTH_TOKEN` 單獨作為環境變數（無 Claude Code credential 檔）能驅動 `provider: anthropic` | `hermes doctor`；實際跑一輪對話 |
 | ~~A18~~ | ~~自寫 plugin 的簽章正確性~~ — **不適用**：已決定走 Auth0，不寫 plugin | — |
@@ -121,12 +116,6 @@ fork 有自訂修改，上游幾乎每週發版（`v2026.7.1` → `v2026.8.13`�
 ---
 
 ## 3. 驗收檢查表
-
-### 階段 0：fork 映像流水線
-- [ ] `fork-image.yml` 成功推出 `ghcr.io/lei-k/hermes-agent:<sha>`
-- [ ] 本機 `docker run --rm <image> version` 可執行
-- [ ] 量測未壓縮映像大小 → **A9**
-- [ ] package 可見性已決定；private 的話 Railway registry credentials 已設 → **A15**
 
 ### 階段 1：容器落地
 - [ ] Google OAuth client 已建立（consent screen = Internal），redirect URI = `https://<domain>/auth/callback`
@@ -168,8 +157,8 @@ fork 有自訂修改，上游幾乎每週發版（`v2026.7.1` → `v2026.8.13`�
 - [ ] 確認容器內沒有與 Hermes 無關的高權限憑證
 
 ### 階段 4：維運
-- [ ] 完成一次上游同步演練（merge upstream → CI 建置 → 改 `HERMES_TAG` → redeploy → 驗版本與資料）
-- [ ] 完成一次回滾演練（`HERMES_TAG` 改回舊 sha）
+- [ ] 完成一次升級演練（改 `HERMES_TAG` → redeploy → 驗版本與資料完整）
+- [ ] 完成一次回滾演練（`HERMES_TAG` 改回舊標籤）
 - [ ] 外部 uptime 監控已接上 `/api/health`
 - [ ] 備份流程已實測可還原
 
