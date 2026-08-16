@@ -1,0 +1,3 @@
+# 實際的 Railway 變數檔（含密鑰）—— 只 commit .env.railway.example
+.env.railway
+.env

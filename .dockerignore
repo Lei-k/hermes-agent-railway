@@ -1,0 +1,9 @@
+# 薄封裝映像只需要 docker/ 底下的開機 hook。其餘一律排除，
+# 讓 build context 保持極小。
+plan/
+scripts/
+README.md
+.env*
+.git/
+.gitignore
+railway.toml

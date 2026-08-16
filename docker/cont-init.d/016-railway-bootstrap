@@ -1,0 +1,142 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Railway 專用容器開機 hook。
+#
+# 以 root 執行，時序上在 01-hermes-setup(stage2-hook.sh) 之後、
+# 02-reconcile-profiles(拉起 gateway s6 slot) 之前。
+#
+# 寫入 /run/s6/container_environment/<KEY> 是 s6-overlay 的環境注入機制：
+# 所有帶 with-contenv shebang 的受監管服務（dashboard、per-profile
+# gateway）以及 main-wrapper.sh 都會讀到。
+#
+# 這個腳本絕不能以非零狀態結束 —— cont-init 失敗在部分 s6-overlay 設定下
+# 會讓整個容器開機中止。每個可能失敗的指令都有 guard，結尾強制 exit 0。
+
+set -u
+
+HERMES_HOME="${HERMES_HOME:-/opt/data}"
+ENVDIR=/run/s6/container_environment
+HERMES_BIN=/opt/hermes/bin/hermes   # exec shim：root 呼叫時自動降權到 hermes
+
+mkdir -p "$ENVDIR" 2>/dev/null || true
+
+log()     { echo "[railway] $*"; }
+set_env() { printf '%s' "$2" > "$ENVDIR/$1" 2>/dev/null && log "$1=$2" || log "WARNING: 無法寫入 $1"; }
+
+# ── 1. Dashboard 是 Railway 唯一的對外入口，強制開啟 ───────────────────
+# 未設 HERMES_DASHBOARD 時，上游的 dashboard s6 服務會以 exit 125
+# 標記為「永久失敗」並保持 down —— healthcheck 就必然失敗。
+case "${HERMES_DASHBOARD:-}" in
+    1|true|TRUE|True|yes|YES|Yes) ;;
+    *) set_env HERMES_DASHBOARD 1 ;;
+esac
+
+# ── 2. 把 dashboard 綁到 Railway 的 PORT ──────────────────────────────
+# 兩種設定風格都支援：直接設 HERMES_DASHBOARD_PORT，或只設 PORT。
+if [ -z "${HERMES_DASHBOARD_PORT:-}" ] && [ -n "${PORT:-}" ]; then
+    set_env HERMES_DASHBOARD_PORT "$PORT"
+fi
+# 容器內 dashboard 預設就綁 0.0.0.0，明寫以防上游預設變動。
+[ -n "${HERMES_DASHBOARD_HOST:-}" ] || set_env HERMES_DASHBOARD_HOST 0.0.0.0
+
+# ── 3. OIDC callback 需要真正的公開網址 ───────────────────────────────
+# callback 是 <public URL>/auth/callback，必須與 Auth0 Application 的
+# Allowed Callback URLs 完全一致。
+#
+# ⚠️ 自訂網域（hermes.relvo.cc）下請「明確設定」HERMES_DASHBOARD_PUBLIC_URL。
+#    Railway 對 RAILWAY_PUBLIC_DOMAIN 的定義是「The public service or
+#    customer domain, of the form example.up.railway.app」—— 掛了自訂網域
+#    之後它取哪個值並未文件化。若仍是 *.up.railway.app，callback 會被組成
+#    錯的 host，Auth0 直接回 redirect_uri_mismatch。
+#    下面的推導只是後備，不是主要路徑。
+if [ -z "${HERMES_DASHBOARD_PUBLIC_URL:-}" ]; then
+    if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
+        log "WARNING: HERMES_DASHBOARD_PUBLIC_URL 未設定，後備推導自 RAILWAY_PUBLIC_DOMAIN。"
+        log "WARNING: 使用自訂網域時請明確設定此變數，否則 OAuth callback 可能指向錯誤的 host。"
+        set_env HERMES_DASHBOARD_PUBLIC_URL "https://${RAILWAY_PUBLIC_DOMAIN}"
+    else
+        log "WARNING: HERMES_DASHBOARD_PUBLIC_URL 與 RAILWAY_PUBLIC_DOMAIN 皆未設定；OAuth callback 將依賴 proxy header 重建。"
+    fi
+fi
+
+# ── 4. 瀏覽器工具的 /dev/shm 旗標 ─────────────────────────────────────
+# Hermes 在偵測到 root 或 AppArmor 受限的 unprivileged userns 時，會自動
+# 注入 --no-sandbox,--disable-dev-shm-usage。但容器內的受監管服務是以
+# hermes(UID 10000) 執行、不是 root，自動注入不一定命中；而 Railway 又
+# 無法設定 --shm-size（Docker 預設 /dev/shm 只有 64MB，Chromium 會掛）。
+#
+# ⚠️ 手動設定 AGENT_BROWSER_ARGS 會「停用」自動注入，所以兩個 flag 必須
+#    一起寫齊，不能只寫一個。
+# 設 HERMES_RAILWAY_BROWSER_ARGS=0 可停用這段（例如改用雲端瀏覽器時）。
+if [ -z "${AGENT_BROWSER_ARGS:-}" ] && [ "${HERMES_RAILWAY_BROWSER_ARGS:-1}" = "1" ]; then
+    set_env AGENT_BROWSER_ARGS "--no-sandbox,--disable-dev-shm-usage"
+fi
+
+# ── 5. 首次開機的 config bootstrap（純變數路徑）───────────────────────
+# model / terminal backend / guardrails 住在 config.yaml，沒有對應的
+# 環境變數，所以用 `hermes config set` 落地一次。
+#
+# 憑證類一律不碰：那些留在 Railway 變數。寫進 .env 會反過來遮蔽平台變數
+# —— $HERMES_HOME/.env 是以 override=True 載入的
+# (hermes_cli/env_loader.py:500)，一旦某個 key 進了 .env，同名的 Railway
+# 變數就永久失效。
+#
+# 標記檔放在 volume 上，所以只有第一次開機會跑，之後不覆蓋操作者的手動調整。
+BOOTSTRAP_MARK="$HERMES_HOME/.railway_bootstrapped"
+CFG_FAILURES=0
+
+cfg_set() {
+    # cfg_set <key> <value> —— 失敗只記 warning，不中斷開機
+    if "$HERMES_BIN" config set "$1" "$2" >/dev/null 2>&1; then
+        log "config set $1=$2"
+    else
+        CFG_FAILURES=$((CFG_FAILURES + 1))
+        log "WARNING: 'hermes config set $1 $2' 失敗"
+    fi
+}
+
+if [ ! -f "$BOOTSTRAP_MARK" ]; then
+    log "首次開機 —— 套用 config bootstrap"
+
+    [ -n "${HERMES_BOOTSTRAP_MODEL:-}" ] && cfg_set model "$HERMES_BOOTSTRAP_MODEL"
+
+    # Railway 沒有 Docker daemon，docker terminal backend 不可用。
+    cfg_set terminal.backend "${HERMES_BOOTSTRAP_TERMINAL_BACKEND:-local}"
+
+    # 自由形式的額外設定，一行一個 key=value。用來落地無人值守部署該開的
+    # 斷路器等等，不必為每一項都加一個專屬環境變數。例如：
+    #   HERMES_BOOTSTRAP_CONFIG="tool_loop_guardrails.hard_stop_enabled=true
+    #   tool_loop_guardrails.hard_stop_after.exact_failure=5"
+    #
+    # 走臨時檔而不是 `printf ... | while`：管線會讓 while 迴圈跑在子 shell,
+    # CFG_FAILURES 的累加就傳不回來，重試判斷會失準。
+    if [ -n "${HERMES_BOOTSTRAP_CONFIG:-}" ]; then
+        _cfg_tmp="$(mktemp 2>/dev/null || echo /tmp/.railway_bootstrap_cfg)"
+        printf '%s\n' "$HERMES_BOOTSTRAP_CONFIG" > "$_cfg_tmp"
+        while IFS= read -r line; do
+            case "$line" in
+                ''|\#*) continue ;;
+                *=*) cfg_set "${line%%=*}" "${line#*=}" ;;
+                *) log "WARNING: HERMES_BOOTSTRAP_CONFIG 略過無法解析的行: $line" ;;
+            esac
+        done < "$_cfg_tmp"
+        rm -f "$_cfg_tmp" 2>/dev/null || true
+    fi
+
+    # 只有全部成功才落標記。有失敗就不落 —— 下次開機會重試，否則一次暫時性
+    # 失敗（CLI 冷啟動逾時等）會讓 config 永遠停在未設定狀態而沒人發現。
+    # 重試是安全的：來源是環境變數，重跑得到相同結果。
+    if [ "$CFG_FAILURES" -eq 0 ]; then
+        : > "$BOOTSTRAP_MARK" 2>/dev/null || true
+        chown hermes:hermes "$BOOTSTRAP_MARK" 2>/dev/null || true
+    else
+        log "WARNING: $CFG_FAILURES 項 config 設定失敗 —— 不落標記，下次開機會重試"
+        log "WARNING: 若持續失敗，用 railway ssh 進容器手動執行 'hermes config set'"
+    fi
+else
+    log "已 bootstrap 過（$BOOTSTRAP_MARK 存在）—— 略過 config 寫入"
+fi
+
+log "bootstrap complete"
+exit 0

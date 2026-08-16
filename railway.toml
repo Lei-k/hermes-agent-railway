@@ -1,0 +1,31 @@
+# Railway config-as-code — https://docs.railway.com/reference/config-as-code
+#
+# 注意 schema 的涵蓋範圍：service source、volume、環境變數、domain 都「不在」
+# 這個檔案裡，必須用 railway CLI 或 dashboard 建立（見 scripts/provision.sh）。
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# ⚠️ startCommand 刻意留空。
+#
+# Railway 的 custom start command 會以 exec form 覆蓋映像的 ENTRYPOINT，
+# 而 Hermes 的 entrypoint-dispatch.sh 承載整條 s6 bootstrap（volume chown、
+# .env/config.yaml seed、config schema migration、gateway 與 dashboard 的
+# 監管樹）。設了它 = 全部跳過。指令已烤進 Dockerfile 的 CMD。
+
+# /api/health 是 Hermes 的免驗證 liveness 端點（hermes_cli/dashboard_auth/
+# public_paths.py 的 PUBLIC_API_PATHS），刻意做得極輕量：不碰 gateway config、
+# 不觸發 plugin 冷載入。即使 dashboard 的驗證閘開著也回 200。
+healthcheckPath = "/api/health"
+
+# 冷開機要跑：volume chown → .env/config.yaml seed → config schema migration
+# → skills sync → Playwright 路徑偵測 → 016 的 config bootstrap → 起 uvicorn。
+# 300 秒是 Railway 的預設上限，對首次開機是安全的。
+healthcheckTimeout = 300
+
+restartPolicyType = "ALWAYS"
+
+# 給 s6 時間把 gateway 收乾淨、讓 SQLite 完成 WAL checkpoint。
+drainingSeconds = 30
