@@ -104,16 +104,24 @@ if [ ! -f "$BOOTSTRAP_MARK" ]; then
     # Railway 沒有 Docker daemon，docker terminal backend 不可用。
     cfg_set terminal.backend "${HERMES_BOOTSTRAP_TERMINAL_BACKEND:-local}"
 
-    # 自由形式的額外設定，一行一個 key=value。用來落地無人值守部署該開的
-    # 斷路器等等，不必為每一項都加一個專屬環境變數。例如：
-    #   HERMES_BOOTSTRAP_CONFIG="tool_loop_guardrails.hard_stop_enabled=true
-    #   tool_loop_guardrails.hard_stop_after.exact_failure=5"
+    # 自由形式的額外設定，一項一個 key=value。用來落地無人值守部署該開的
+    # 斷路器等等，不必為每一項都加一個專屬環境變數。
+    #
+    # 分隔符「換行或分號皆可」—— Railway 的變數面板對多行值支援不一，
+    # 分號寫法可以整串塞在一行裡：
+    #   HERMES_BOOTSTRAP_CONFIG="a.b=true; a.c=5"
+    #   HERMES_BOOTSTRAP_CONFIG="a.b=true
+    #   a.c=5"
     #
     # 走臨時檔而不是 `printf ... | while`：管線會讓 while 迴圈跑在子 shell,
     # CFG_FAILURES 的累加就傳不回來，重試判斷會失準。
     if [ -n "${HERMES_BOOTSTRAP_CONFIG:-}" ]; then
         _cfg_tmp="$(mktemp 2>/dev/null || echo /tmp/.railway_bootstrap_cfg)"
-        printf '%s\n' "$HERMES_BOOTSTRAP_CONFIG" > "$_cfg_tmp"
+        # tr 把分號轉成換行；sed 去掉每行前後空白（"a=1; b=2" 拆開後
+        # 第二段會帶前導空白，不去掉的話 key 會變成 " b"）。
+        printf '%s\n' "$HERMES_BOOTSTRAP_CONFIG" \
+            | tr ';' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' > "$_cfg_tmp"
         while IFS= read -r line; do
             case "$line" in
                 ''|\#*) continue ;;

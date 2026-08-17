@@ -82,7 +82,65 @@
 
 ### 2. Railway
 
+repo 已在 GitHub 上，用連接 GitHub 的方式部署最順 —— 之後 `git push` 就會自動重建（剛好對上升級流程：改 `HERMES_TAG` → push → 完成）。
+
+**2.1 建立 service**
+
+[railway.com](https://railway.com) → **New Project** → **Deploy from GitHub repo** → 選 `Lei-k/hermes-agent-railway`。
+
+Railway 會讀到 `railway.toml`，自動用 `builder = "DOCKERFILE"`。**第一次部署會失敗是正常的** —— 變數還沒設，dashboard 因為找不到 auth provider 而 fail closed。
+
+> ⚠️ **Settings → Deploy → Custom Start Command 必須留空。** 設了會覆蓋映像的 ENTRYPOINT，整條 s6 bootstrap 被跳過。
+
+**2.2 加 Volume**
+
+服務上按 `⌘K` / 右鍵 → **Add Volume**，mount path 填 **`/opt/data`**。
+
+必須在第一次成功開機前加好，否則資料會落在 ephemeral 磁碟，重新部署就消失。
+
+**2.3 設變數**
+
+**Variables → Raw Editor**，一次貼上（值請換成真實的）：
+
 ```bash
+RAILWAY_RUN_UID=0
+PORT=9119
+HERMES_DASHBOARD=1
+HERMES_DASHBOARD_HOST=0.0.0.0
+HERMES_DASHBOARD_PORT=9119
+HERMES_TIMEZONE=Asia/Taipei
+HERMES_GATEWAY_BOOTSTRAP_STATE=running
+HERMES_DASHBOARD_PUBLIC_URL=https://hermes.relvo.cc
+HERMES_DASHBOARD_OIDC_ISSUER=https://<tenant>.<region>.auth0.com/
+HERMES_DASHBOARD_OIDC_CLIENT_ID=<auth0 client id>
+HERMES_DASHBOARD_OIDC_CLIENT_SECRET=<auth0 client secret>
+CLAUDE_CODE_OAUTH_TOKEN=<claude setup-token 產生>
+HERMES_BOOTSTRAP_MODEL=anthropic/<claude-model-id>
+HERMES_BOOTSTRAP_TERMINAL_BACKEND=local
+HERMES_BOOTSTRAP_CONFIG=tool_loop_guardrails.hard_stop_enabled=true; tool_loop_guardrails.hard_stop_after.exact_failure=5
+TELEGRAM_BOT_TOKEN=<選配>
+OPENROUTER_API_KEY=<選配，備援 provider>
+```
+
+各變數的作用與注意事項見 [`.env.railway.example`](./.env.railway.example) 與 [`plan/04`](./plan/04-configuration-reference.md)。
+
+**2.4 掛自訂網域**
+
+**Settings → Networking → Custom Domain** → `hermes.relvo.cc`，**target port 選 9119**。
+
+依 Railway 給的值加 **CNAME + TXT 兩筆** DNS 記錄 —— 只加 CNAME 不會驗證通過（會回 404）。等 Let's Encrypt 憑證簽發（通常一小時內）。
+
+確認可用後**把 Railway 自動產生的 `*.up.railway.app` 網域移除** —— 留著等於 dashboard 有第二個對外入口。
+
+**2.5 重新部署**
+
+變數設好後 **Deployments → Redeploy**。
+
+<details>
+<summary>替代路徑：用 railway CLI</summary>
+
+```bash
+npm i -g @railway/cli
 cp .env.railway.example .env.railway   # 填入真實值
 railway login
 railway link
@@ -90,9 +148,8 @@ railway link
 ./scripts/provision.sh --apply         # 執行
 ```
 
-依 Railway 給的值加上 **CNAME + TXT 兩筆** DNS 記錄（只加 CNAME 不會驗證通過，會回 404），等憑證簽發。
-
-確認 `https://hermes.relvo.cc` 可用之後，**把 Railway 自動產生的 `*.up.railway.app` 網域移除** —— 留著等於 dashboard 有第二個對外入口。
+CLI 路徑不會自動連 GitHub，之後升級要手動 `railway up`。
+</details>
 
 ### 3. 驗收
 
