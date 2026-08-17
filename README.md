@@ -77,8 +77,30 @@
    （`allowed` 填實際要放行的帳號。本 repo 公開，文件一律只放佔位符。）
 
 > **`email_verified` 的檢查與關閉 Database connection 是同一個攻擊面的兩道保險，兩個都要做。** 白名單只比對 email，而自助註冊的 email 是使用者自己填的。
->
-> **Google OAuth client 的 redirect URI 是 Auth0 的**（`https://<tenant>.<region>.auth0.com/login/callback`），不是 Hermes 的。兩層不要搞混。
+
+**兩層 OAuth，憑證別填錯層**
+
+```
+瀏覽器 ──①──> Hermes dashboard ──②──> Auth0 ──③──> Google
+                                  ↑              ↑
+                        這層憑證填 Railway   這層憑證填 Auth0 UI
+```
+
+| 憑證 | 從哪拿 | 填到哪 | 該層的 redirect URI |
+|---|---|---|---|
+| **Auth0 Application** 的 Client ID / Secret | Auth0 → Applications → 你的 App → **Settings** → Basic Information | **Railway 變數** `HERMES_DASHBOARD_OIDC_CLIENT_ID` / `_CLIENT_SECRET` | Auth0 的 Allowed Callback URLs = `https://hermes.relvo.cc/auth/callback` |
+| **Google OAuth client** 的 Client ID / Secret | Google Cloud Console → Credentials | **Auth0 UI** → Authentication → Social → Google connection | Google 的 Authorized redirect URI = `https://<tenant>.<region>.auth0.com/login/callback` |
+
+**Google 那組不會進 Railway。** Hermes 只認 Auth0，不知道背後是 Google 還是別的 IdP。
+
+`HERMES_DASHBOARD_OIDC_ISSUER` 取自同一頁的 **Domain** 欄位（如 `dev-ab12cd.us.auth0.com`），自己補上 `https://` 與尾斜線。驗證：
+
+```bash
+curl -s https://<tenant>.<region>.auth0.com/.well-known/openid-configuration | jq '.issuer'
+# 回傳的字串就是要填的值；拿不到東西表示 Domain 抄錯
+```
+
+> Application 型別建成 **Single Page Application** 的話不會有 Client Secret（public + PKCE），`HERMES_DASHBOARD_OIDC_CLIENT_SECRET` 留空不設即可 —— Hermes 兩種都支援。
 
 ### 2. Railway
 
@@ -243,6 +265,8 @@ Deploy log 檢查：
 |---|---|
 | Healthcheck 失敗 | ① log 有無 `not PID 1` ② dashboard 是否 fail-closed（缺 auth provider）③ `PORT` 與 `HERMES_DASHBOARD_PORT` 是否一致 |
 | `redirect_uri_mismatch` | `HERMES_DASHBOARD_PUBLIC_URL` 是否等於 `https://hermes.relvo.cc`；與 Auth0 的 Allowed Callback URLs 是否完全一致 |
+| `no auth providers are registered`（dashboard 拒絕啟動） | `HERMES_DASHBOARD_OIDC_ISSUER` + `_CLIENT_ID` 是否真的到得了容器（`railway ssh` → `env \| grep OIDC`）。**錯誤訊息只會回報 `nous` plugin 的 skip 原因，不會提到 self-hosted OIDC** —— 訊息沒列出它不代表不支援 |
+| 填了 Google 的 client id 卻登入失敗 | 填錯層了。Railway 變數要填 **Auth0 Application** 的憑證；Google 那組填在 Auth0 的 Google connection 裡 |
 | 自訂網域回 404 | TXT 記錄漏了，或憑證還在簽發 |
 | 登入頁出現兩個 provider | 有多餘的 auth provider 註冊了 —— 檢查是否誤設 `HERMES_ALLOWLIST_*` 或其他 provider 的變數 |
 | 代理人不回訊息 | ① dashboard Status 頁的 gateway 狀態 ② `hermes gateway status` ③ `HERMES_GATEWAY_BOOTSTRAP_STATE=running` 是否有設 ④ 是否撞 Claude Code 訂閱限額 |
